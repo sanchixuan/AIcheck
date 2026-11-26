@@ -22,13 +22,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import com.ai.aicheat.service.VolumeKeyService
 import com.ai.aicheat.ui.theme.AicheatTheme
-import com.ai.aicheat.util.ConfigManager
+import com.ai.aicheat.ui.ApiProfilesCard
 import com.ai.aicheat.util.RootUtils
 import kotlinx.coroutines.launch
 
@@ -126,25 +123,6 @@ fun MainScreen(
     onCheckRoot: () -> Unit
 ) {
     val context = LocalContext.current
-    // 使用ConfigManager持久化配置
-    var apiUrl by remember { mutableStateOf(ConfigManager.apiUrl) }
-    var apiKey by remember { mutableStateOf("") }
-    var keyLoaded by remember { mutableStateOf(false) }
-    var keyReadError by remember { mutableStateOf(false) }
-    var saving by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
-    LaunchedEffect(Unit) {
-        try {
-            apiKey = withContext(Dispatchers.IO) { ConfigManager.readApiKey() }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            keyReadError = true
-        }
-        keyLoaded = true
-    }
-    var model by remember { mutableStateOf(ConfigManager.model) }
-    var prompt by remember { mutableStateOf(ConfigManager.prompt) }
     val state by VolumeKeyService.state.collectAsState()
     val result by VolumeKeyService.lastResult.collectAsState()
     
@@ -220,89 +198,8 @@ fun MainScreen(
                 }
             }
             
-            // API配置
-            Card(
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Text(
-                        text = "API配置",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 18.sp
-                    )
-                    
-                    OutlinedTextField(
-                        value = apiUrl,
-                        onValueChange = { apiUrl = it },
-                        label = { Text("API URL") },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
-                    )
-                    
-                    OutlinedTextField(
-                        value = apiKey,
-                        enabled = keyLoaded && !saving,
-                        visualTransformation = PasswordVisualTransformation(),
-                        onValueChange = { apiKey = it },
-                        label = { Text("API Key") },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
-                    )
-                    
-                    if (keyReadError) Text("旧密钥读取失败，请重新输入密钥后保存。")
+            ApiProfilesCard()
 
-                    OutlinedTextField(
-                        value = model,
-                        onValueChange = { model = it },
-                        label = { Text("模型") },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
-                    )
-                    
-                    OutlinedTextField(
-                        value = prompt,
-                        onValueChange = { prompt = it },
-                        label = { Text("自定义Prompt") },
-                        modifier = Modifier.fillMaxWidth(),
-                        minLines = 3,
-                        maxLines = 6,
-                        placeholder = { Text("请输入AI分析图片时使用的提示词...") }
-                    )
-                    
-                    Button(
-                        onClick = {
-                            saving = true
-                            val key = apiKey
-                            val url = apiUrl
-                            val selectedModel = model
-                            val selectedPrompt = prompt
-                            scope.launch {
-                                try {
-                                    withContext(Dispatchers.IO) {
-                                        ConfigManager.save(url, key, selectedModel, selectedPrompt)
-                                    }
-                                    keyReadError = false
-                                    Toast.makeText(context, "配置已保存", Toast.LENGTH_SHORT).show()
-                                } catch (e: CancellationException) {
-                                    throw e
-                                } catch (e: Exception) {
-                                    Toast.makeText(context, "保存配置失败", Toast.LENGTH_SHORT).show()
-                                } finally {
-                                    saving = false
-                                }
-                            }
-                        },
-                        enabled = keyLoaded && !saving && (!keyReadError || apiKey.isNotBlank()),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("保存配置")
-                    }
-                }
-            }
-            
             // 操作按钮
             Row(
                 modifier = Modifier.fillMaxWidth(),
