@@ -46,25 +46,3 @@ jobs:
           path: app/build/outputs/apk/release/app-release-unsigned.apk
           if-no-files-found: error
           retention-days: 14
-  retire-build-branch:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: release
-    runs-on: ubuntu-24.04
-    timeout-minutes: 3
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 4
-      - name: Remove the merged temporary build branch
-        run: |
-          ref='refs/heads/build/release-cdf61f9'
-          merged_tip='55aab228672ca0075f533c7adfee8a6851e5e8a3'
-          remote_tip="$(git ls-remote origin "$ref" | cut -f1)"
-          if [ -z "$remote_tip" ]; then
-            exit 0
-          fi
-          test "$remote_tip" = "$merged_tip"
-          git merge-base --is-ancestor "$merged_tip" HEAD
-          git push --force-with-lease="$ref:$merged_tip" origin ":$ref"
