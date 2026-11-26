@@ -1,5 +1,7 @@
 package com.ai.aicheat
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -20,7 +22,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
-import com.ai.aicheat.service.AIService
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.ai.aicheat.service.VolumeKeyService
 import com.ai.aicheat.ui.theme.AicheatTheme
 import com.ai.aicheat.util.ConfigManager
@@ -33,6 +38,8 @@ class MainActivity : ComponentActivity() {
         private const val OVERLAY_PERMISSION_REQUEST = 1001
     }
     
+    private var checkingRoot by mutableStateOf(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -43,6 +50,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             AicheatTheme {
                 MainScreen(
+                    checkingRoot = checkingRoot,
                     onStartService = { startMonitorService() },
                     onStopService = { stopMonitorService() },
                     onCheckRoot = { checkRoot() }
@@ -68,20 +76,24 @@ class MainActivity : ComponentActivity() {
             return
         }
         
+        if (checkingRoot) return
+        checkingRoot = true
         lifecycleScope.launch {
-            val hasRoot = RootUtils.checkRootAccess()
-            if (hasRoot) {
-                VolumeKeyService.start(this@MainActivity)
-                Toast.makeText(this@MainActivity, "服务已启动", Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(this@MainActivity, "需要Root权限", Toast.LENGTH_SHORT).show()
+            try {
+                if (RootUtils.checkRootAccess()) VolumeKeyService.start(this@MainActivity)
+                else Toast.makeText(this@MainActivity, "需要Root权限", Toast.LENGTH_SHORT).show()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: RuntimeException) {
+                Toast.makeText(this@MainActivity, "系统未允许启动服务", Toast.LENGTH_SHORT).show()
+            } finally {
+                checkingRoot = false
             }
         }
     }
     
     private fun stopMonitorService() {
         VolumeKeyService.stop(this)
-        Toast.makeText(this, "服务已停止", Toast.LENGTH_SHORT).show()
     }
     
     private fun checkRoot() {
@@ -108,6 +120,7 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
+    checkingRoot: Boolean,
     onStartService: () -> Unit,
     onStopService: () -> Unit,
     onCheckRoot: () -> Unit
@@ -115,10 +128,25 @@ fun MainScreen(
     val context = LocalContext.current
     // 使用ConfigManager持久化配置
     var apiUrl by remember { mutableStateOf(ConfigManager.apiUrl) }
-    var apiKey by remember { mutableStateOf(ConfigManager.apiKey) }
+    var apiKey by remember { mutableStateOf("") }
+    var keyLoaded by remember { mutableStateOf(false) }
+    var keyReadError by remember { mutableStateOf(false) }
+    var saving by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(Unit) {
+        try {
+            apiKey = withContext(Dispatchers.IO) { ConfigManager.readApiKey() }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            keyReadError = true
+        }
+        keyLoaded = true
+    }
     var model by remember { mutableStateOf(ConfigManager.model) }
     var prompt by remember { mutableStateOf(ConfigManager.prompt) }
-    var isServiceRunning by remember { mutableStateOf(VolumeKeyService.isRunning()) }
+    val state by VolumeKeyService.state.collectAsState()
+    val result by VolumeKeyService.lastResult.collectAsState()
     
     Scaffold(
         modifier = Modifier.fillMaxSize(),
@@ -150,9 +178,25 @@ fun MainScreen(
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = if (isServiceRunning) "✅ 运行中" else "⚫ 已停止",
+                        text = when {
+                            checkingRoot || state == VolumeKeyService.State.STARTING -> "启动中"
+                            state == VolumeKeyService.State.RUNNING -> "运行中"
+                            state == VolumeKeyService.State.STOPPING -> "正在停止"
+                            else -> "已停止"
+                        },
                         fontSize = 16.sp
                     )
+                    if (result.isNotEmpty()) {
+                        TextButton(onClick = {
+                            val clipboard = context.getSystemService(ClipboardManager::class.java)
+                            try {
+                                checkNotNull(clipboard).setPrimaryClip(ClipData.newPlainText("AI 回复", result))
+                                Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
+                            } catch (e: RuntimeException) {
+                                Toast.makeText(context, "系统未允许复制", Toast.LENGTH_SHORT).show()
+                            }
+                        }) { Text("复制最近结果") }
+                    }
                 }
             }
             
@@ -200,12 +244,16 @@ fun MainScreen(
                     
                     OutlinedTextField(
                         value = apiKey,
+                        enabled = keyLoaded && !saving,
+                        visualTransformation = PasswordVisualTransformation(),
                         onValueChange = { apiKey = it },
                         label = { Text("API Key") },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true
                     )
                     
+                    if (keyReadError) Text("旧密钥读取失败，请重新输入密钥后保存。")
+
                     OutlinedTextField(
                         value = model,
                         onValueChange = { model = it },
@@ -226,17 +274,28 @@ fun MainScreen(
                     
                     Button(
                         onClick = {
-                            // 保存到ConfigManager
-                            ConfigManager.apiUrl = apiUrl
-                            ConfigManager.apiKey = apiKey
-                            ConfigManager.model = model
-                            ConfigManager.prompt = prompt
-                            // 同时更新AIService的内存配置
-                            AIService.updateConfig(
-                                AIService.AIConfig(apiUrl, apiKey, model)
-                            )
-                            Toast.makeText(context, "配置已保存", Toast.LENGTH_SHORT).show()
+                            saving = true
+                            val key = apiKey
+                            val url = apiUrl
+                            val selectedModel = model
+                            val selectedPrompt = prompt
+                            scope.launch {
+                                try {
+                                    withContext(Dispatchers.IO) {
+                                        ConfigManager.save(url, key, selectedModel, selectedPrompt)
+                                    }
+                                    keyReadError = false
+                                    Toast.makeText(context, "配置已保存", Toast.LENGTH_SHORT).show()
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    Toast.makeText(context, "保存配置失败", Toast.LENGTH_SHORT).show()
+                                } finally {
+                                    saving = false
+                                }
+                            }
                         },
+                        enabled = keyLoaded && !saving && (!keyReadError || apiKey.isNotBlank()),
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text("保存配置")
@@ -257,23 +316,17 @@ fun MainScreen(
                 }
                 
                 Button(
-                    onClick = {
-                        onStartService()
-                        isServiceRunning = true
-                    },
+                    onClick = onStartService,
                     modifier = Modifier.weight(1f),
-                    enabled = !isServiceRunning
+                    enabled = !checkingRoot && state == VolumeKeyService.State.STOPPED
                 ) {
                     Text("启动服务")
                 }
                 
                 Button(
-                    onClick = {
-                        onStopService()
-                        isServiceRunning = false
-                    },
+                    onClick = onStopService,
                     modifier = Modifier.weight(1f),
-                    enabled = isServiceRunning,
+                    enabled = state == VolumeKeyService.State.RUNNING,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.error
                     )

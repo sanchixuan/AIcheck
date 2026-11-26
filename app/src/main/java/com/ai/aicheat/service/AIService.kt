@@ -1,210 +1,89 @@
 package com.ai.aicheat.service
 
 import android.graphics.Bitmap
-import android.util.Base64
-import android.util.Log
 import com.ai.aicheat.util.ConfigManager
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
+import okhttp3.Response
+import okio.Buffer
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
 
-/**
- * AI服务类
- * 负责将截图发送到AI接口并获取响应
- */
 object AIService {
-    private const val TAG = "AIService"
-    
-    // TODO: 请替换为您的AI API配置
-    // 注意：现在使用ConfigManager持久化配置，以下默认值仅作为备份
-    private const val API_URL = "https://api.openai.com/v1/chat/completions"
-    private const val API_KEY = "YOUR_API_KEY_HERE"  // 替换为您的API Key
-    private const val MODEL = "gpt-4o"  // 或其他支持视觉的模型
-    
     private val client = OkHttpClient.Builder()
         .connectTimeout(60, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
         .build()
-    
-    /**
-     * 将Bitmap转换为Base64字符串
-     */
-    private fun bitmapToBase64(bitmap: Bitmap, quality: Int = 80): String {
-        val outputStream = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, quality, outputStream)
-        val bytes = outputStream.toByteArray()
-        return Base64.encodeToString(bytes, Base64.NO_WRAP)
-    }
-    
-    /**
-     * 发送截图到AI并获取响应（使用持久化配置）
-     * @param bitmap 截图
-     * @param prompt 提示词（可选）
-     * @return AI响应文本
-     */
-    suspend fun analyzeScreenshot(
-        bitmap: Bitmap,
-        prompt: String? = null
-    ): Result<String> = withContext(Dispatchers.IO) {
+
+    suspend fun analyzeScreenshot(bitmap: Bitmap): Result<String> = withContext(Dispatchers.IO) {
         try {
-            // 使用持久化配置
-            val apiUrl = ConfigManager.apiUrl
-            val apiKey = ConfigManager.apiKey
-            val model = ConfigManager.model
-            val finalPrompt = prompt ?: ConfigManager.prompt
-            
-            if (apiKey.isBlank()) {
-                return@withContext Result.failure(Exception("请先配置API Key"))
+            val config = ConfigManager.requestConfig()
+            if (config.key.isBlank()) return@withContext failure("请先配置 API Key")
+            val prompt = JSONObject().put("type", "text").put("text", config.prompt)
+            val image = Buffer()
+            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 80, image.outputStream())) {
+                return@withContext failure("图片编码失败")
             }
-            
-            val base64Image = bitmapToBase64(bitmap)
-            
-            // 构建请求体
-            val messageContent = JSONArray().apply {
-                put(JSONObject().apply {
-                    put("type", "text")
-                    put("text", finalPrompt)
-                })
-                put(JSONObject().apply {
-                    put("type", "image_url")
-                    put("image_url", JSONObject().apply {
-                        put("url", "data:image/jpeg;base64,$base64Image")
-                        put("detail", "high")
-                    })
-                })
-            }
-            
-            val messages = JSONArray().apply {
-                put(JSONObject().apply {
-                    put("role", "user")
-                    put("content", messageContent)
-                })
-            }
-            
-            val requestBody = JSONObject().apply {
-                put("model", model)
-                put("messages", messages)
-                put("max_tokens", 1000)
-            }
-            
-            val request = Request.Builder()
-                .url(apiUrl)
-                .addHeader("Authorization", "Bearer $apiKey")
-                .addHeader("Content-Type", "application/json")
-                .post(requestBody.toString().toRequestBody("application/json".toMediaType()))
+            val body = ImageChatBody(JSONObject.quote(config.model), prompt.toString(), image.snapshot())
+            val request = Request.Builder().url(config.url)
+                .header("Authorization", "Bearer ${config.key}")
+                .post(body)
                 .build()
-            
-            Log.d(TAG, "Sending request to AI API...")
-            
-            val response = client.newCall(request).execute()
-            val responseBody = response.body?.string()
-            
-            if (response.isSuccessful && responseBody != null) {
-                val jsonResponse = JSONObject(responseBody)
-                val content = jsonResponse
-                    .getJSONArray("choices")
-                    .getJSONObject(0)
-                    .getJSONObject("message")
-                    .getString("content")
-                
-                Log.d(TAG, "AI Response received: ${content.take(100)}...")
-                Result.success(content)
-            } else {
-                val error = "API Error: ${response.code} - $responseBody"
-                Log.e(TAG, error)
-                Result.failure(Exception(error))
-            }
+            awaitReply(client.newCall(request))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: IllegalArgumentException) {
+            failure("请检查 API 地址与配置格式")
         } catch (e: Exception) {
-            Log.e(TAG, "AI request failed", e)
-            Result.failure(e)
+            failure("无法读取配置或准备请求")
         }
     }
-    
-    /**
-     * 配置API（运行时更新）
-     */
-    data class AIConfig(
-        val apiUrl: String,
-        val apiKey: String,
-        val model: String
-    )
-    
-    private var currentConfig: AIConfig? = null
-    
-    fun updateConfig(config: AIConfig) {
-        currentConfig = config
+
+    internal suspend fun awaitReply(call: Call): Result<String> = suspendCancellableCoroutine { pending ->
+        pending.invokeOnCancellation { call.cancel() }
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                pending.resume(failure(if (e is SocketTimeoutException) "连接超时" else "网络连接失败"))
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                val result = try {
+                    response.use {
+                        if (it.isSuccessful) {
+                            val content = JSONObject(it.body?.string().orEmpty())
+                                .getJSONArray("choices").getJSONObject(0)
+                                .getJSONObject("message").opt("content") as? String
+                            if (content.isNullOrBlank()) failure("接口返回了空结果") else Result.success(content)
+                        } else {
+                            failure(when (it.code) {
+                                401 -> "密钥无效"
+                                403 -> "接口拒绝访问"
+                                429 -> "请求过于频繁或额度不足"
+                                else -> "请求失败（HTTP ${it.code}）"
+                            })
+                        }
+                    }
+                } catch (e: SocketTimeoutException) {
+                    failure("读取结果超时")
+                } catch (e: IOException) {
+                    failure("读取结果时连接中断")
+                } catch (e: Exception) {
+                    failure("接口返回格式异常")
+                }
+                pending.resume(result)
+            }
+        })
     }
-    
-    /**
-     * 使用自定义配置发送请求
-     */
-    suspend fun analyzeWithConfig(
-        bitmap: Bitmap,
-        config: AIConfig,
-        prompt: String = "请仔细分析这张图片，如果是题目请直接给出答案，如果是其他内容请简要描述。回答要简洁。"
-    ): Result<String> = withContext(Dispatchers.IO) {
-        try {
-            val base64Image = bitmapToBase64(bitmap)
-            
-            val messageContent = JSONArray().apply {
-                put(JSONObject().apply {
-                    put("type", "text")
-                    put("text", prompt)
-                })
-                put(JSONObject().apply {
-                    put("type", "image_url")
-                    put("image_url", JSONObject().apply {
-                        put("url", "data:image/jpeg;base64,$base64Image")
-                        put("detail", "high")
-                    })
-                })
-            }
-            
-            val messages = JSONArray().apply {
-                put(JSONObject().apply {
-                    put("role", "user")
-                    put("content", messageContent)
-                })
-            }
-            
-            val requestBody = JSONObject().apply {
-                put("model", config.model)
-                put("messages", messages)
-                put("max_tokens", 1000)
-            }
-            
-            val request = Request.Builder()
-                .url(config.apiUrl)
-                .addHeader("Authorization", "Bearer ${config.apiKey}")
-                .addHeader("Content-Type", "application/json")
-                .post(requestBody.toString().toRequestBody("application/json".toMediaType()))
-                .build()
-            
-            val response = client.newCall(request).execute()
-            val responseBody = response.body?.string()
-            
-            if (response.isSuccessful && responseBody != null) {
-                val jsonResponse = JSONObject(responseBody)
-                val content = jsonResponse
-                    .getJSONArray("choices")
-                    .getJSONObject(0)
-                    .getJSONObject("message")
-                    .getString("content")
-                
-                Result.success(content)
-            } else {
-                Result.failure(Exception("API Error: ${response.code}"))
-            }
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
+
+    private fun failure(message: String): Result<String> = Result.failure(IOException(message))
 }

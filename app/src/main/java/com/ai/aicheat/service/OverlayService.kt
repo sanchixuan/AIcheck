@@ -111,7 +111,7 @@ class OverlayService : Service() {
                 clearOverlayText()
             }
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
     
     private fun createOverlayView() {
@@ -179,7 +179,6 @@ class OverlayService : Service() {
                 overlayView?.visibility = View.VISIBLE
             }
         }
-        Log.d(TAG, "Showing text with Markdown/LaTeX rendering: ${text.take(50)}...")
     }
     
     private fun toggleTextVisibility() {

@@ -4,27 +4,24 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.os.Build
-import android.os.Handler
 import android.os.IBinder
-import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import com.ai.aicheat.MainActivity
-import com.ai.aicheat.R
 import com.ai.aicheat.util.RootUtils
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.io.BufferedReader
 import java.io.DataOutputStream
 import java.io.InputStreamReader
@@ -35,6 +32,8 @@ import java.io.InputStreamReader
  */
 class VolumeKeyService : LifecycleService() {
     
+    enum class State { STOPPED, STARTING, RUNNING, STOPPING }
+
     companion object {
         private const val TAG = "VolumeKeyService"
         private const val NOTIFICATION_ID = 1001
@@ -44,32 +43,40 @@ class VolumeKeyService : LifecycleService() {
         private const val KEY_VOLUME_DOWN = "KEY_VOLUMEDOWN"
         private const val KEY_VOLUME_UP = "KEY_VOLUMEUP"
         
-        private var instance: VolumeKeyService? = null
-        
-        fun isRunning(): Boolean = instance != null
-        
+        private val mutableState = MutableStateFlow(State.STOPPED)
+        val state = mutableState.asStateFlow()
+        private val mutableResult = MutableStateFlow("")
+        val lastResult = mutableResult.asStateFlow()
+
         fun start(context: Context) {
+            if (mutableState.value != State.STOPPED) return
+            mutableState.value = State.STARTING
             val intent = Intent(context, VolumeKeyService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
+                else context.startService(intent)
+            } catch (e: RuntimeException) {
+                mutableState.value = State.STOPPED
+                throw e
             }
         }
-        
+
         fun stop(context: Context) {
-            context.stopService(Intent(context, VolumeKeyService::class.java))
+            mutableState.value = State.STOPPING
+            mutableResult.value = ""
+            if (!context.stopService(Intent(context, VolumeKeyService::class.java))) {
+                mutableState.value = State.STOPPED
+            }
+            context.stopService(Intent(context, OverlayService::class.java))
         }
     }
-    
+
     private var keyMonitorJob: Job? = null
-    private var monitorProcess: Process? = null
+    @Volatile private var monitorProcess: Process? = null
     private var isProcessing = false  // 防止重复触发
-    private val mainHandler = Handler(Looper.getMainLooper())
     
     override fun onCreate() {
         super.onCreate()
-        instance = this
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification())
         startKeyMonitor()
@@ -77,6 +84,7 @@ class VolumeKeyService : LifecycleService() {
         // 同时启动悬浮窗服务
         startService(Intent(this, OverlayService::class.java))
         
+        mutableState.value = State.RUNNING
         Log.d(TAG, "VolumeKeyService started")
     }
     
@@ -101,7 +109,7 @@ class VolumeKeyService : LifecycleService() {
                 setShowBadge(false)
             }
             val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
+            manager?.createNotificationChannel(channel)
         }
     }
     
@@ -136,6 +144,10 @@ class VolumeKeyService : LifecycleService() {
                 val process = Runtime.getRuntime().exec("su")
                 monitorProcess = process
                 
+                if (!isActive) {
+                    process.destroy()
+                    return@launch
+                }
                 val os = DataOutputStream(process.outputStream)
                 // getevent -l 会输出可读的事件名称
                 os.writeBytes("getevent -l\n")
@@ -166,17 +178,19 @@ class VolumeKeyService : LifecycleService() {
                         if (currentTime - lastVolumeUpTime > debounceTime) {
                             lastVolumeUpTime = currentTime
                             Log.d(TAG, "Volume UP pressed")
-                            onVolumeUpPressed()
+                            lifecycleScope.launch {
+                                if (state.value == State.RUNNING) onVolumeUpPressed()
+                            }
                         }
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                Log.e(TAG, "Key monitor error", e)
-                // 尝试重启监听
-                delay(3000)
-                if (isActive) {
-                    startKeyMonitor()
-                }
+                Log.w(TAG, "Key monitor stopped")
+            } finally {
+                monitorProcess?.destroy()
+                if (isActive) stopSelf()
             }
         }
     }
@@ -185,12 +199,8 @@ class VolumeKeyService : LifecycleService() {
      * 音量下键按下 - 截图并发送AI
      */
     private fun onVolumeDownPressed() {
-        if (isProcessing) {
-            Log.d(TAG, "Already processing, skip")
-            return
-        }
-        
         lifecycleScope.launch {
+            if (isProcessing || state.value != State.RUNNING) return@launch
             isProcessing = true
             try {
                 // 显示处理提示
@@ -203,35 +213,31 @@ class VolumeKeyService : LifecycleService() {
                 Log.d(TAG, "Taking screenshot...")
                 val bitmap = RootUtils.takeScreenshotAsBitmap()
                 
-                if (bitmap != null) {
-                    Log.d(TAG, "Screenshot taken, sending to AI...")
-                    OverlayService.showText(this@VolumeKeyService, "正在分析...")
-                    
-                    // 发送到AI
-                    val result = AIService.analyzeScreenshot(bitmap)
-                    
-                    result.onSuccess { response ->
-                        Log.d(TAG, "AI response: ${response.take(100)}")
-                        OverlayService.showText(this@VolumeKeyService, response)
-                        
-                        // 使用Android原生API复制到剪贴板（必须在主线程执行）
-                        copyToClipboard(response)
-                    }
-                    
-                    result.onFailure { error ->
-                        Log.e(TAG, "AI error", error)
-                        OverlayService.showText(this@VolumeKeyService, "错误: ${error.message}")
-                    }
-                    
-                    // 回收bitmap
-                    bitmap.recycle()
-                } else {
-                    Log.e(TAG, "Screenshot failed")
-                    OverlayService.showText(this@VolumeKeyService, "截图失败")
+                if (state.value != State.RUNNING) {
+                    bitmap?.recycle()
+                    return@launch
                 }
+                if (bitmap == null) {
+                    OverlayService.showText(this@VolumeKeyService, "截图失败")
+                    return@launch
+                }
+                try {
+                    OverlayService.showText(this@VolumeKeyService, "正在分析...")
+                    val reply = AIService.analyzeScreenshot(bitmap)
+                    if (state.value != State.RUNNING) return@launch
+                    reply.onSuccess { text ->
+                        mutableResult.value = text
+                        OverlayService.showText(this@VolumeKeyService, text)
+                    }.onFailure { error ->
+                        OverlayService.showText(this@VolumeKeyService, error.message ?: "请求失败")
+                    }
+                } finally {
+                    bitmap.recycle()
+                }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                Log.e(TAG, "Process error", e)
-                OverlayService.showText(this@VolumeKeyService, "处理失败: ${e.message}")
+                if (state.value == State.RUNNING) OverlayService.showText(this@VolumeKeyService, "处理失败")
             } finally {
                 isProcessing = false
             }
@@ -245,26 +251,6 @@ class VolumeKeyService : LifecycleService() {
         OverlayService.hideText(this)
     }
     
-    /**
-     * 复制文本到剪贴板（使用Android原生API）
-     */
-    private fun copyToClipboard(text: String) {
-        mainHandler.post {
-            try {
-                val clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                val clipData = ClipData.newPlainText("AI Response", text)
-                clipboardManager.setPrimaryClip(clipData)
-                Log.d(TAG, "AI response copied to clipboard successfully")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to copy to clipboard", e)
-                // 如果原生API失败，尝试使用Root方式
-                lifecycleScope.launch {
-                    RootUtils.copyToClipboard(text)
-                }
-            }
-        }
-    }
-    
     override fun onDestroy() {
         super.onDestroy()
         keyMonitorJob?.cancel()
@@ -273,7 +259,9 @@ class VolumeKeyService : LifecycleService() {
         } catch (e: Exception) {
             Log.e(TAG, "Error destroying process", e)
         }
-        instance = null
+        stopService(Intent(this, OverlayService::class.java))
+        mutableResult.value = ""
+        mutableState.value = State.STOPPED
         Log.d(TAG, "VolumeKeyService stopped")
     }
 }
