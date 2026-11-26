@@ -1,3 +1,7 @@
+# AIcheck
+
+Fork 维护者：喵喵轩。上游项目：[alwayslone/AIcheck](https://github.com/alwayslone/AIcheck)。
+
 一个使用root权限运行的快捷作业检查软件
 
 通过截图发给ai，再将ai返回的结果显示出来

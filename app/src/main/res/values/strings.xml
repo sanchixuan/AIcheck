@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">快速检查作业</string>
+    <string name="app_release_credit">作者：喵喵轩 · 版本 %1$s</string>
 </resources>
